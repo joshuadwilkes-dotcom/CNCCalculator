@@ -138,13 +138,18 @@ class FoamCAMEngine:
         raw_sim_time = total_cut_time + total_ramp_time + tool_swap_penalty
 
         return {
-            "total_time_min": raw_sim_time,
-            "tool_changes": tool_changes,
-            "tools_used": list(unique_tools_used)
-        }import math
-import numpy as np
-import trimesh
-from shapely.geometry import Polygon
+            "file_name": uploaded_file.name,
+            "total_area": round(total_area, 2),
+            "total_layers": len(meshes),
+            "removed_vol": round(total_removed_vol, 2),
+            "simulated_time_min": round(accumulated_cam_time, 2),
+            "tool_changes": total_swaps,
+            "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET"
+        }
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 # Tool parameters matching your Fusion 360 Tool Library
 CAM_CONFIG = {
