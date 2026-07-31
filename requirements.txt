@@ -1,7 +1,5 @@
 streamlit
 trimesh
-cascadio
-scikit-learn
-numpy
-pandas
 shapely
+networkx
+numpy
