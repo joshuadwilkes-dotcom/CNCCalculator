@@ -16,7 +16,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # 1. Base table creation (for fresh DB environments)
     c.execute('''
         CREATE TABLE IF NOT EXISTS job_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +29,6 @@ def init_db():
         )
     ''')
     
-    # 2. Schema check: add missing columns to live Streamlit Cloud DB instances
     c.execute("PRAGMA table_info(job_history)")
     existing_columns = [col[1] for col in c.fetchall()]
     
@@ -38,7 +36,6 @@ def init_db():
         c.execute("ALTER TABLE job_history ADD COLUMN simulated_cam_time REAL DEFAULT 0.0")
         
     if "created_at" not in existing_columns:
-        # SQLite constraint fix: ALTER TABLE requires static/constant defaults
         c.execute("ALTER TABLE job_history ADD COLUMN created_at TIMESTAMP")
         
     conn.commit()
@@ -75,9 +72,9 @@ cam_engine = FoamCAMEngine()
 # -------------------------------------------------------------------
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
-def process_step_file(uploaded_file):
+def process_cad_file(uploaded_file):
     """
-    Slices CAD mesh geometry, scales units, and runs feature-aware CAM simulation.
+    Loads STL/STEP mesh geometry, normalizes units, and runs CAM simulation.
     """
     file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     temp_path = f"temp_{uploaded_file.name}"
@@ -86,13 +83,21 @@ def process_step_file(uploaded_file):
         f.write(uploaded_file.getbuffer())
 
     try:
-        # Pass file_type explicitly to route trimesh to the CAD/STEP loader backend
+        # Load the scene based on extension
         if file_ext in ['.step', '.stp']:
-            scene = trimesh.load(temp_path, file_type='step')
+            try:
+                scene = trimesh.load(temp_path, file_type='step')
+            except Exception as e:
+                st.error(f"STEP parser missing or failed. Switch Streamlit Cloud to Python 3.11, or upload an .STL file instead. Error: {e}")
+                return None
         else:
-            scene = trimesh.load(temp_path)
+            scene = trimesh.load(temp_path) # Natively handles STL
 
         meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
+
+        if not meshes:
+            st.error("No valid 3D geometry could be extracted from the uploaded file.")
+            return None
 
         stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0]
         total_area = 0.0
@@ -102,8 +107,10 @@ def process_step_file(uploaded_file):
         all_tools = set()
 
         for mesh in meshes:
-            # Scale fix: Meters to Inches for STEP exports
-            mesh.apply_scale(39.3701)
+            # If STEP, it usually imports as meters. If STL, it imports as whatever you exported it as.
+            # We assume STL is exported in inches, STEP needs scaling from meters.
+            if file_ext in ['.step', '.stp']:
+                mesh.apply_scale(39.3701)
 
             extents = mesh.extents
             x, y, z = extents[0], extents[1], extents[2]
@@ -121,7 +128,7 @@ def process_step_file(uploaded_file):
             total_removed_vol += removed_vol
 
             # Detect complex 3D surface features
-            is_3d = mesh.is_watertight and (len(mesh.faces) > 5000)
+            is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
 
             # RUN CAM SIMULATION
             sim_res = cam_engine.estimate_layer_cam_time(
@@ -144,6 +151,10 @@ def process_step_file(uploaded_file):
             "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET"
         }
 
+    except Exception as e:
+        st.error(f"Error parsing geometry: {e}")
+        return None
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -158,44 +169,45 @@ st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Sim
 
 st.markdown("---")
 
-# File Upload Dropzone
-uploaded_file = st.file_uploader("Upload STEP CAD File (.step, .stp)", type=["step", "stp"])
+# File Upload Dropzone - Now strictly encouraging STL for stability
+uploaded_file = st.file_uploader("Upload CAD File (.stl, .step, .stp)", type=["stl", "step", "stp"])
 
 if uploaded_file is not None:
     with st.spinner("Analyzing CAD geometry & running kinematic CAM simulator..."):
-        res = process_step_file(uploaded_file)
+        res = process_cad_file(uploaded_file)
 
-    st.success("Simulation Complete!")
+    if res is not None:
+        st.success("Simulation Complete!")
 
-    # Calculated CAD & CAM Metrics
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Simulated Cut Time", f"{res['simulated_time_min']} mins")
-    m2.metric("Material Removed", f"{res['removed_vol']} in³")
-    m3.metric("Total Layers", res['total_layers'])
-    m4.metric("Tool Swaps", res['tool_changes'])
+        # Calculated CAD & CAM Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Simulated Cut Time", f"{res['simulated_time_min']} mins")
+        m2.metric("Material Removed", f"{res['removed_vol']} in³")
+        m3.metric("Total Layers", res['total_layers'])
+        m4.metric("Tool Swaps", res['tool_changes'])
 
-    st.info(f"**Tools Called in Simulation:** {res['tools_list']}")
+        st.info(f"**Tools Called in Simulation:** {res['tools_list']}")
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # Real-World Floor Time Logger for Database Training
-    st.subheader("📝 Record Actual Floor Time")
-    st.write("Log actual machine runs to feed the central database history (`vc_history.db`).")
+        # Real-World Floor Time Logger for Database Training
+        st.subheader("📝 Record Actual Floor Time")
+        st.write("Log actual machine runs to feed the central database history (`vc_history.db`).")
 
-    with st.form("log_actual_time_form"):
-        actual_floor_time = st.number_input("Actual Floor Run Time (Minutes):", min_value=0.1, value=float(res['simulated_time_min']), step=0.5)
-        submit_btn = st.form_submit_button("Save Job to Database")
+        with st.form("log_actual_time_form"):
+            actual_floor_time = st.number_input("Actual Floor Run Time (Minutes):", min_value=0.1, value=float(res['simulated_time_min']), step=0.5)
+            submit_btn = st.form_submit_button("Save Job to Database")
 
-        if submit_btn:
-            save_job_to_db(
-                file_name=res['file_name'],
-                total_area=res['total_area'],
-                total_layers=res['total_layers'],
-                removed_vol=res['removed_vol'],
-                sim_time=res['simulated_time_min'],
-                actual_time=actual_floor_time
-            )
-            st.success(f"Saved **{res['file_name']}** to database!")
+            if submit_btn:
+                save_job_to_db(
+                    file_name=res['file_name'],
+                    total_area=res['total_area'],
+                    total_layers=res['total_layers'],
+                    removed_vol=res['removed_vol'],
+                    sim_time=res['simulated_time_min'],
+                    actual_time=actual_floor_time
+                )
+                st.success(f"Saved **{res['file_name']}** to database!")
 
 # -------------------------------------------------------------------
 # 4. DATABASE HISTORY VIEW
