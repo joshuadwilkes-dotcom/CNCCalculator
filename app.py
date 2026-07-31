@@ -72,9 +72,9 @@ cam_engine = FoamCAMEngine()
 # -------------------------------------------------------------------
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
-def process_step_file(uploaded_file):
+def process_step_file(uploaded_file, unit_choice):
     """
-    Loads STEP mesh geometry, automatically scales from Meters to Inches, and runs CAM simulation.
+    Loads STEP mesh geometry, flattens assemblies, scales to Inches, and runs CAM simulation.
     """
     temp_path = f"temp_{uploaded_file.name}"
     
@@ -83,68 +83,66 @@ def process_step_file(uploaded_file):
 
     try:
         try:
-            # Force STEP parsing explicitly
             scene = trimesh.load(temp_path, file_type='step')
         except Exception as e:
             st.error(f"STEP parser failed. Ensure Streamlit Cloud is set to Python 3.11 or 3.12. Error: {e}")
             return None
 
-        meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
+        # 1. FLATTEN MULTI-BODY ASSEMBLIES
+        # If the STEP file has multiple parts (e.g. lid, base, cutouts), merge them into one 
+        # single unified mesh. This preserves their exact positions and gives us the true bounding box.
+        if isinstance(scene, trimesh.Scene):
+            mesh = scene.dump(concatenate=True)
+        else:
+            mesh = scene
 
-        if not meshes:
+        if mesh.is_empty:
             st.error("No valid 3D geometry could be extracted from the uploaded file.")
             return None
 
-        stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0]
-        total_area = 0.0
-        total_removed_vol = 0.0
-        accumulated_cam_time = 0.0
-        total_swaps = 0
-        all_tools = set()
-        
-        final_x, final_y = 0.0, 0.0
+        # 2. APPLY UNIT SCALING TO INCHES
+        scale_factor = 1.0
+        if unit_choice == "Millimeters (Standard for STEP)":
+            scale_factor = 1.0 / 25.4
+        elif unit_choice == "Meters":
+            scale_factor = 39.3701
+        # If "Inches", scale remains 1.0
 
-        for mesh in meshes:
-            # STEP files via trimesh/cascadio import as Meters. Scale precisely to Inches.
-            mesh.apply_scale(39.3701)
+        mesh.apply_scale(scale_factor)
 
-            extents = mesh.extents
-            final_x, final_y, z = extents[0], extents[1], extents[2]
+        # 3. GET PHYSICAL DIMENSIONS
+        extents = mesh.extents
+        final_x, final_y, z = extents[0], extents[1], extents[2]
 
-            categorized_z = 6.0
-            for size in stock_sizes:
-                if z <= size:
-                    categorized_z = size
-                    break
+        stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]
+        categorized_z = 9.0
+        for size in stock_sizes:
+            if z <= size:
+                categorized_z = size
+                break
 
-            stock_vol = final_x * final_y * categorized_z
-            removed_vol = max(0.0, stock_vol - mesh.volume)
+        stock_vol = final_x * final_y * categorized_z
+        removed_vol = max(0.0, stock_vol - mesh.volume)
+        total_area = final_x * final_y
 
-            total_area += (final_x * final_y)
-            total_removed_vol += removed_vol
+        # Detect complex 3D surface features
+        is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
 
-            # Detect complex 3D surface features
-            is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
-
-            # RUN CAM SIMULATION
-            sim_res = cam_engine.estimate_layer_cam_time(
-                mesh=mesh,
-                layer_z_height=categorized_z,
-                is_3d_surface=is_3d
-            )
-
-            accumulated_cam_time += sim_res.get("total_time_min", 0.0)
-            total_swaps += sim_res.get("tool_changes", 0)
-            all_tools.update(sim_res.get("tools_used", []))
+        # 4. RUN CAM SIMULATION
+        sim_res = cam_engine.estimate_layer_cam_time(
+            mesh=mesh,
+            layer_z_height=categorized_z,
+            is_3d_surface=is_3d
+        )
 
         return {
             "file_name": uploaded_file.name,
             "total_area": round(total_area, 2),
-            "total_layers": len(meshes),
-            "removed_vol": round(total_removed_vol, 2),
-            "simulated_time_min": round(accumulated_cam_time, 2),
-            "tool_changes": total_swaps,
-            "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET",
+            "total_layers": 1, # Flattened to a single stock piece
+            "removed_vol": round(removed_vol, 2),
+            "simulated_time_min": round(sim_res.get("total_time_min", 0.0), 2),
+            "tool_changes": sim_res.get("tool_changes", 0),
+            "tools_list": ", ".join(sim_res.get("tools_used", [])) if sim_res.get("tools_used") else "5/8_POCKET",
             "detected_x": round(final_x, 2),
             "detected_y": round(final_y, 2)
         }
@@ -167,14 +165,26 @@ st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Sim
 
 st.markdown("---")
 
-uploaded_file = st.file_uploader("Upload STEP File (.step, .stp)", type=["step", "stp"])
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    # Most CAD software (Fusion/Onshape) writes STEPs in Millimeters by default
+    unit_choice = st.radio(
+        "1. STEP Export Units", 
+        ["Millimeters (Standard for STEP)", "Inches", "Meters"],
+        index=0, 
+        help="STEP files often default to mm behind the scenes. Adjust this if your detected part size is incorrect."
+    )
+
+with col2:
+    uploaded_file = st.file_uploader("2. Upload STEP File (.step, .stp)", type=["step", "stp"])
 
 if uploaded_file is not None:
     with st.spinner("Analyzing CAD geometry & running kinematic CAM simulator..."):
-        res = process_step_file(uploaded_file)
+        res = process_step_file(uploaded_file, unit_choice)
 
     if res is not None:
-        st.success(f"Simulation Complete! (Detected Part Size: {res['detected_x']}\" x {res['detected_y']}\")")
+        st.success(f"Simulation Complete! (Detected Outer Bounds: **{res['detected_x']}\" x {res['detected_y']}\"**)")
 
         # Calculated CAD & CAM Metrics
         m1, m2, m3, m4 = st.columns(4)
