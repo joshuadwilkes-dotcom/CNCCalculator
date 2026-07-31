@@ -79,12 +79,19 @@ def process_step_file(uploaded_file):
     """
     Slices CAD mesh geometry, scales units, and runs feature-aware CAM simulation.
     """
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     temp_path = f"temp_{uploaded_file.name}"
+    
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
     try:
-        scene = trimesh.load(temp_path)
+        # Pass file_type explicitly to route trimesh to the CAD/STEP loader backend
+        if file_ext in ['.step', '.stp']:
+            scene = trimesh.load(temp_path, file_type='step')
+        else:
+            scene = trimesh.load(temp_path)
+
         meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
 
         stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0]
