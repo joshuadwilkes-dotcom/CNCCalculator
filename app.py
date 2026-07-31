@@ -4,16 +4,15 @@ import math
 import streamlit as st
 import trimesh
 
-# Import standalone CAM simulator module
 from cam_engine import FoamCAMEngine
 
 # -------------------------------------------------------------------
-# 1. DATABASE SETUP (vc_history.db)
+# 1. DATABASE SETUP WITH AUTO-MIGRATION
 # -------------------------------------------------------------------
 DB_PATH = "vc_history.db"
 
 def init_db():
-    """Initializes the SQLite database table for training history."""
+    """Initializes and migrates the SQLite database safely."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -28,11 +27,17 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Auto-migration check: ensure simulated_cam_time column exists in old DBs
+    c.execute("PRAGMA table_info(job_history)")
+    columns = [col[1] for col in c.fetchall()]
+    if "simulated_cam_time" not in columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN simulated_cam_time REAL DEFAULT 0.0")
+        
     conn.commit()
     conn.close()
 
 def save_job_to_db(file_name, total_area, total_layers, removed_vol, sim_time, actual_time):
-    """Saves a completed floor job to SQLite for future AI training."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -43,7 +48,6 @@ def save_job_to_db(file_name, total_area, total_layers, removed_vol, sim_time, a
     conn.close()
 
 def fetch_all_jobs():
-    """Retrieves recorded jobs from database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT file_name, total_area, total_layers, removed_vol, simulated_cam_time, actual_time, created_at FROM job_history ORDER BY id DESC")
@@ -51,19 +55,13 @@ def fetch_all_jobs():
     conn.close()
     return rows
 
-# Initialize DB on start
 init_db()
-
-# Initialize CAM Simulation Engine
 cam_engine = FoamCAMEngine()
 
 # -------------------------------------------------------------------
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
 def process_step_file(uploaded_file):
-    """
-    Slices CAD mesh geometry, scales units, and runs feature-aware CAM simulation.
-    """
     temp_path = f"temp_{uploaded_file.name}"
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -80,13 +78,11 @@ def process_step_file(uploaded_file):
         all_tools = set()
 
         for mesh in meshes:
-            # Unit Fix: Scale from Meters to Inches (STEP standard export fix)
-            mesh.apply_scale(39.3701)
+            mesh.apply_scale(39.3701)  # Scale Meters to Inches
 
             extents = mesh.extents
             x, y, z = extents[0], extents[1], extents[2]
 
-            # Categorize layer thickness
             categorized_z = 6.0
             for size in stock_sizes:
                 if z <= size:
@@ -99,24 +95,17 @@ def process_step_file(uploaded_file):
             total_area += (x * y)
             total_removed_vol += removed_vol
 
-            # Detect complex 3D surface features (e.g., parallel rastering)
             is_3d = mesh.is_watertight and (len(mesh.faces) > 5000)
 
-            # RUN FEATURE-AWARE CAM SIMULATION
             sim_res = cam_engine.estimate_layer_cam_time(
                 mesh=mesh,
                 layer_z_height=categorized_z,
                 is_3d_surface=is_3d
             )
 
-            # Fixed key lookup: check for 'total_time' or 'total_time_min'
-            layer_time = sim_res.get("total_time_min", sim_res.get("total_time", 0.0))
-            accumulated_cam_time += layer_time
-            
+            accumulated_cam_time += sim_res.get("total_time_min", 0.0)
             total_swaps += sim_res.get("tool_changes", 0)
-            
-            tools_used = sim_res.get("tools_used", sim_res.get("unique_tools", []))
-            all_tools.update(tools_used)
+            all_tools.update(sim_res.get("tools_used", []))
 
         return {
             "file_name": uploaded_file.name,
@@ -142,7 +131,6 @@ st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Sim
 
 st.markdown("---")
 
-# Main Upload Zone
 uploaded_file = st.file_uploader("Upload STEP CAD File (.step, .stp)", type=["step", "stp"])
 
 if uploaded_file is not None:
@@ -151,7 +139,6 @@ if uploaded_file is not None:
 
     st.success("Simulation Complete!")
 
-    # Display Calculated CAD & CAM Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Simulated Cut Time", f"{res['simulated_time_min']} mins")
     m2.metric("Material Removed", f"{res['removed_vol']} in³")
@@ -162,7 +149,6 @@ if uploaded_file is not None:
 
     st.markdown("---")
 
-    # Real-World Floor Time Logger for Database Training
     st.subheader("📝 Record Actual Floor Time")
     st.write("Log actual machine runs to feed the central database history (`vc_history.db`).")
 
