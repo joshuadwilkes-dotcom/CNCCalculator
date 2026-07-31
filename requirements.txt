@@ -3,4 +3,4 @@ trimesh
 shapely
 networkx
 numpy
-casadi
+cascadio
