@@ -72,26 +72,22 @@ cam_engine = FoamCAMEngine()
 # -------------------------------------------------------------------
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
-def process_cad_file(uploaded_file):
+def process_step_file(uploaded_file):
     """
-    Loads STL/STEP mesh geometry, normalizes units, and runs CAM simulation.
+    Loads STEP mesh geometry, automatically scales from Meters to Inches, and runs CAM simulation.
     """
-    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     temp_path = f"temp_{uploaded_file.name}"
     
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
     try:
-        # Load the scene based on extension
-        if file_ext in ['.step', '.stp']:
-            try:
-                scene = trimesh.load(temp_path, file_type='step')
-            except Exception as e:
-                st.error(f"STEP parser missing or failed. Switch Streamlit Cloud to Python 3.11, or upload an .STL file instead. Error: {e}")
-                return None
-        else:
-            scene = trimesh.load(temp_path) # Natively handles STL
+        try:
+            # Force STEP parsing explicitly
+            scene = trimesh.load(temp_path, file_type='step')
+        except Exception as e:
+            st.error(f"STEP parser failed. Ensure Streamlit Cloud is set to Python 3.11 or 3.12. Error: {e}")
+            return None
 
         meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
 
@@ -105,15 +101,15 @@ def process_cad_file(uploaded_file):
         accumulated_cam_time = 0.0
         total_swaps = 0
         all_tools = set()
+        
+        final_x, final_y = 0.0, 0.0
 
         for mesh in meshes:
-            # If STEP, it usually imports as meters. If STL, it imports as whatever you exported it as.
-            # We assume STL is exported in inches, STEP needs scaling from meters.
-            if file_ext in ['.step', '.stp']:
-                mesh.apply_scale(39.3701)
+            # STEP files via trimesh/cascadio import as Meters. Scale precisely to Inches.
+            mesh.apply_scale(39.3701)
 
             extents = mesh.extents
-            x, y, z = extents[0], extents[1], extents[2]
+            final_x, final_y, z = extents[0], extents[1], extents[2]
 
             categorized_z = 6.0
             for size in stock_sizes:
@@ -121,10 +117,10 @@ def process_cad_file(uploaded_file):
                     categorized_z = size
                     break
 
-            stock_vol = x * y * categorized_z
+            stock_vol = final_x * final_y * categorized_z
             removed_vol = max(0.0, stock_vol - mesh.volume)
 
-            total_area += (x * y)
+            total_area += (final_x * final_y)
             total_removed_vol += removed_vol
 
             # Detect complex 3D surface features
@@ -148,7 +144,9 @@ def process_cad_file(uploaded_file):
             "removed_vol": round(total_removed_vol, 2),
             "simulated_time_min": round(accumulated_cam_time, 2),
             "tool_changes": total_swaps,
-            "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET"
+            "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET",
+            "detected_x": round(final_x, 2),
+            "detected_y": round(final_y, 2)
         }
 
     except Exception as e:
@@ -169,15 +167,14 @@ st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Sim
 
 st.markdown("---")
 
-# File Upload Dropzone - Now strictly encouraging STL for stability
-uploaded_file = st.file_uploader("Upload CAD File (.stl, .step, .stp)", type=["stl", "step", "stp"])
+uploaded_file = st.file_uploader("Upload STEP File (.step, .stp)", type=["step", "stp"])
 
 if uploaded_file is not None:
     with st.spinner("Analyzing CAD geometry & running kinematic CAM simulator..."):
-        res = process_cad_file(uploaded_file)
+        res = process_step_file(uploaded_file)
 
     if res is not None:
-        st.success("Simulation Complete!")
+        st.success(f"Simulation Complete! (Detected Part Size: {res['detected_x']}\" x {res['detected_y']}\")")
 
         # Calculated CAD & CAM Metrics
         m1, m2, m3, m4 = st.columns(4)
@@ -195,7 +192,8 @@ if uploaded_file is not None:
         st.write("Log actual machine runs to feed the central database history (`vc_history.db`).")
 
         with st.form("log_actual_time_form"):
-            actual_floor_time = st.number_input("Actual Floor Run Time (Minutes):", min_value=0.1, value=float(res['simulated_time_min']), step=0.5)
+            safe_default = max(0.1, float(res['simulated_time_min']))
+            actual_floor_time = st.number_input("Actual Floor Run Time (Minutes):", min_value=0.1, value=safe_default, step=0.5)
             submit_btn = st.form_submit_button("Save Job to Database")
 
             if submit_btn:
