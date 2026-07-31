@@ -16,7 +16,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # 1. Base table creation
+    # 1. Base table creation (for fresh DB environments)
     c.execute('''
         CREATE TABLE IF NOT EXISTS job_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +38,8 @@ def init_db():
         c.execute("ALTER TABLE job_history ADD COLUMN simulated_cam_time REAL DEFAULT 0.0")
         
     if "created_at" not in existing_columns:
-        c.execute("ALTER TABLE job_history ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        # SQLite constraint fix: ALTER TABLE requires static/constant defaults
+        c.execute("ALTER TABLE job_history ADD COLUMN created_at TIMESTAMP")
         
     conn.commit()
     conn.close()
