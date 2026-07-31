@@ -4,7 +4,7 @@ import math
 import streamlit as st
 import trimesh
 
-# Import your standalone CAM simulator module
+# Import standalone CAM simulator module
 from cam_engine import FoamCAMEngine
 
 # -------------------------------------------------------------------
@@ -60,7 +60,7 @@ cam_engine = FoamCAMEngine()
 # -------------------------------------------------------------------
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
-def process_step_file(uploaded_file, dual_head_mode=False):
+def process_step_file(uploaded_file):
     """
     Slices CAD mesh geometry, scales units, and runs feature-aware CAM simulation.
     """
@@ -109,19 +109,21 @@ def process_step_file(uploaded_file, dual_head_mode=False):
                 is_3d_surface=is_3d
             )
 
-            accumulated_cam_time += sim_res["total_time_min"]
-            total_swaps += sim_res["tool_changes"]
-            all_tools.update(sim_res["tools_used"])
-
-        # Apply Dual-Head setup factor if toggled
-        final_sim_time = accumulated_cam_time * 0.5 if dual_head_mode else accumulated_cam_time
+            # Fixed key lookup: check for 'total_time' or 'total_time_min'
+            layer_time = sim_res.get("total_time_min", sim_res.get("total_time", 0.0))
+            accumulated_cam_time += layer_time
+            
+            total_swaps += sim_res.get("tool_changes", 0)
+            
+            tools_used = sim_res.get("tools_used", sim_res.get("unique_tools", []))
+            all_tools.update(tools_used)
 
         return {
             "file_name": uploaded_file.name,
             "total_area": round(total_area, 2),
             "total_layers": len(meshes),
             "removed_vol": round(total_removed_vol, 2),
-            "simulated_time_min": round(final_sim_time, 2),
+            "simulated_time_min": round(accumulated_cam_time, 2),
             "tool_changes": total_swaps,
             "tools_list": ", ".join(all_tools) if all_tools else "5/8_POCKET"
         }
@@ -138,11 +140,6 @@ st.set_page_config(page_title="SourceMade CAM Estimator", page_icon="⚙️", la
 st.title("⚙️ SourceMade Feature-Aware CAM Estimator")
 st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Simulation")
 
-# Top Controls Bar
-col_cfg1, col_cfg2 = st.columns([1, 2])
-with col_cfg1:
-    dual_head_mode = st.checkbox("Dual-Head Spindle Setup (0.5x Time Multiplier)", value=False)
-
 st.markdown("---")
 
 # Main Upload Zone
@@ -150,7 +147,7 @@ uploaded_file = st.file_uploader("Upload STEP CAD File (.step, .stp)", type=["st
 
 if uploaded_file is not None:
     with st.spinner("Analyzing CAD geometry & running kinematic CAM simulator..."):
-        res = process_step_file(uploaded_file, dual_head_mode=dual_head_mode)
+        res = process_step_file(uploaded_file)
 
     st.success("Simulation Complete!")
 
