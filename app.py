@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import trimesh
+import cadquery as cq
 
 from cam_engine import FoamCAMEngine
 
@@ -83,38 +83,72 @@ init_db()
 cam_engine = FoamCAMEngine()
 
 # -------------------------------------------------------------------
-# 2. FEATURE-BASED MULTIPLE LINEAR REGRESSION
+# 2. TWO-PASS LINEAR REGRESSION (OUTLIER AWARE)
 # -------------------------------------------------------------------
-def calculate_feature_multipliers(df):
+def calculate_feature_multipliers(df, include_outliers=False):
     base_mults = {"outline": 1.0, "pocket": 1.0, "3d": 1.0}
     
     if df is None or df.empty:
         return base_mults
 
-    valid = df[(df["Actual (min)"] > 0) & (df["Total Simulated (min)"] > 0)]
+    valid = df[(df["Actual (min)"] > 0) & (df["Total Simulated (min)"] > 0)].copy()
     if len(valid) < 3: 
         return base_mults 
 
-    X = valid[["est_outline", "est_pocket", "est_3d"]].values
-    y = valid["Actual (min)"].values
+    def run_ols(data):
+        X = data[["est_outline", "est_pocket", "est_3d"]].values
+        y = data["Actual (min)"].values
 
-    prior_X = np.array([
-        [10.0, 0.0, 0.0],
-        [0.0, 10.0, 0.0],
-        [0.0, 0.0, 10.0]
-    ])
-    prior_y = np.array([10.0, 10.0, 10.0])
+        # Regularization micro-prior to prevent Singular Matrix Errors
+        prior_X = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ])
+        prior_y = np.array([1.0, 1.0, 1.0])
 
-    X_reg = np.vstack([X, prior_X])
-    y_reg = np.concatenate([y, prior_y])
+        X_reg = np.vstack([X, prior_X])
+        y_reg = np.concatenate([y, prior_y])
 
-    coeffs = np.linalg.lstsq(X_reg, y_reg, rcond=None)[0]
+        coeffs = np.linalg.lstsq(X_reg, y_reg, rcond=None)[0]
 
-    base_mults["outline"] = max(0.25, min(4.0, coeffs[0]))
-    base_mults["pocket"] = max(0.25, min(4.0, coeffs[1]))
-    base_mults["3d"] = max(0.25, min(4.0, coeffs[2]))
+        return {
+            "outline": max(0.25, min(4.0, coeffs[0])),
+            "pocket": max(0.25, min(4.0, coeffs[1])),
+            "3d": max(0.25, min(4.0, coeffs[2]))
+        }
 
-    return base_mults
+    # Pass 1: Calculate rough baseline using all data
+    mults_pass1 = run_ols(valid)
+
+    if include_outliers:
+        return mults_pass1
+
+    # Pass 2: Identify and strip outliers, then recalculate
+    valid["temp_pred"] = (valid["est_outline"] * mults_pass1["outline"]) + \
+                         (valid["est_pocket"] * mults_pass1["pocket"]) + \
+                         (valid["est_3d"] * mults_pass1["3d"])
+
+    valid["temp_error"] = ((valid["Actual (min)"] - valid["temp_pred"]).abs() / valid["temp_pred"].replace(0, 0.1)) * 100
+    
+    outlier_mask = (valid["temp_error"] > 25.0) & ((valid["Actual (min)"] - valid["temp_pred"]).abs() >= 2.0)
+    valid_filtered = valid[~outlier_mask]
+
+    # Fallback if we accidentally stripped too much data to run the math
+    if len(valid_filtered) < 3:
+        return mults_pass1
+
+    return run_ols(valid_filtered)
+
+# -------------------------------------------------------------------
+# 3. STREAMLIT USER INTERFACE & STATE
+# -------------------------------------------------------------------
+st.set_page_config(page_title="SourceMade CAM Estimator", page_icon="⚙️", layout="wide")
+
+st.title("⚙️ SourceMade Feature-Aware CAM Estimator")
+st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Simulation")
+
+include_outliers_toggle = st.toggle("Include Outliers in Machine Learning", value=False, help="If disabled, the algorithm dynamically excludes jobs flagged as ⚠️ Outliers to prevent skewed predictions.")
 
 history_data = fetch_all_jobs()
 df = pd.DataFrame(history_data, columns=[
@@ -122,10 +156,13 @@ df = pd.DataFrame(history_data, columns=[
     "est_outline", "est_pocket", "est_3d", "Total Simulated (min)", "Actual (min)"
 ]) if history_data else pd.DataFrame()
 
-multipliers = calculate_feature_multipliers(df)
+multipliers = calculate_feature_multipliers(df, include_outliers=include_outliers_toggle)
+
+st.info(f"🧠 **Live ML Kinematic Modifiers:** Outline (`{multipliers['outline']:.2f}x`) | Pocket (`{multipliers['pocket']:.2f}x`) | 3D Surface (`{multipliers['3d']:.2f}x`)")
+st.markdown("---")
 
 # -------------------------------------------------------------------
-# 3. CAD PROCESSING & CAM SIMULATION LOGIC
+# 4. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
 def process_step_file(uploaded_file, unit_choice):
     temp_path = f"temp_{uploaded_file.name}"
@@ -134,15 +171,21 @@ def process_step_file(uploaded_file, unit_choice):
 
     try:
         try:
-            scene = trimesh.load(temp_path, file_type='step')
+            # CadQuery completely preserves B-Rep geometry and assembly structure
+            wp = cq.importers.importStep(temp_path)
         except Exception as e:
-            st.error(f"STEP parser failed. Error: {e}")
+            st.error(f"CadQuery kernel parser failed. Error: {e}")
             return None
 
-        meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
-        if not meshes: return None
+        solids = wp.solids().vals()
+        if not solids: 
+            st.error("No valid solid bodies found in STEP file.")
+            return None
         
-        scale_factor = 1.0 / 25.4 if "Millimeters" in unit_choice else 39.3701 if unit_choice == "Meters" else 1.0
+        # Scaling is handled in variables rather than kernel transformations to prevent C++ crash loops
+        length_scale = 1.0 / 25.4 if "Millimeters" in unit_choice else 39.3701 if unit_choice == "Meters" else 1.0
+        area_scale = length_scale ** 2
+        vol_scale = length_scale ** 3
 
         total_outline_time = 0.0
         total_pocket_time = 0.0
@@ -156,27 +199,28 @@ def process_step_file(uploaded_file, unit_choice):
         max_detected_x = 0.0
         max_detected_y = 0.0
 
-        for mesh in meshes:
-            if mesh.is_empty: continue
+        for solid in solids:
+            bb = solid.BoundingBox()
+            extents = [bb.xlen * length_scale, bb.ylen * length_scale, bb.zlen * length_scale]
             
-            mesh.apply_scale(scale_factor)
-
-            extents = mesh.extents
+            # Skip micro-bodies (screws, dust, artifacts)
             if max(extents) < 1.0: 
                 continue 
 
+            # Auto-Orientation: Forces the Z-axis to be the shortest dimension
             min_axis = np.argmin(extents)
-            if min_axis == 0: mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi/2, [0, 1, 0]))
-            elif min_axis == 1: mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi/2, [1, 0, 0]))
+            if min_axis == 0: 
+                solid = solid.rotate((0,0,0), (0,1,0), 90)
+            elif min_axis == 1: 
+                solid = solid.rotate((0,0,0), (1,0,0), 90)
                 
-            extents = mesh.extents
-            final_x, final_y, z = extents[0], extents[1], extents[2]
+            bb = solid.BoundingBox()
+            final_x = bb.xlen * length_scale
+            final_y = bb.ylen * length_scale
+            z = bb.zlen * length_scale
             
             max_detected_x = max(max_detected_x, final_x)
             max_detected_y = max(max_detected_y, final_y)
-
-            center = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
-            mesh.apply_translation([-center[0], -center[1], -mesh.bounds[0][2]])
 
             categorized_z = 9.0
             for size in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]:
@@ -185,43 +229,18 @@ def process_step_file(uploaded_file, unit_choice):
                     break
 
             stock_vol = final_x * final_y * categorized_z
-            actual_mesh_vol = abs(mesh.volume) if not math.isnan(getattr(mesh, "volume", float('nan'))) else stock_vol 
+            actual_mesh_vol = solid.Volume() * vol_scale
             removed_vol = max(0.0, stock_vol - actual_mesh_vol)
-            if removed_vol <= 0.5: removed_vol = stock_vol * 0.35
-
-            # -----------------------------------------------------------
-            # UPGRADED 3D GEOMETRY DETECTION LOGIC (Draft-Aware)
-            # -----------------------------------------------------------
-            is_3d = False
-            if hasattr(mesh, "face_normals") and len(mesh.face_normals) > 0:
-                z_normals = np.abs(mesh.face_normals[:, 2])
-                
-                # Find faces that are angled (greater than ~3 degrees off vertical, less than flat)
-                angled_faces_mask = (z_normals > 0.05) & (z_normals < 0.99)
-                
-                # Spatial Filter: Ignore the outermost perimeter (External Draft)
-                min_x, min_y = mesh.bounds[0][:2]
-                max_x, max_y = mesh.bounds[1][:2]
-                
-                # Determine if a face center is within 0.3 inches of the absolute outer edge
-                face_centers = mesh.triangles_center
-                margin = 0.3 
-                
-                on_outer_perimeter = (
-                    (face_centers[:, 0] < min_x + margin) | (face_centers[:, 0] > max_x - margin) |
-                    (face_centers[:, 1] < min_y + margin) | (face_centers[:, 1] > max_y - margin)
-                )
-                
-                # Filter out the perimeter draft faces from the 3D check
-                valid_3d_faces = angled_faces_mask & (~on_outer_perimeter)
-                angled_count = np.sum(valid_3d_faces)
-                
-                if (angled_count / len(z_normals) > 0.05) or (angled_count > 200):
-                    is_3d = True
-            # -----------------------------------------------------------
+            
+            if removed_vol <= 0.5: 
+                removed_vol = stock_vol * 0.35
 
             sim_res = cam_engine.estimate_layer_cam_time(
-                mesh=mesh, layer_z_height=categorized_z, removed_vol=removed_vol, is_3d_surface=is_3d
+                solid=solid, 
+                layer_z_height=categorized_z, 
+                removed_vol=removed_vol,
+                area_scale=area_scale,
+                length_scale=length_scale
             )
 
             total_outline_time += sim_res["est_outline"]
@@ -258,17 +277,6 @@ def process_step_file(uploaded_file, unit_choice):
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
 
-# -------------------------------------------------------------------
-# 4. STREAMLIT USER INTERFACE
-# -------------------------------------------------------------------
-st.set_page_config(page_title="SourceMade CAM Estimator", page_icon="⚙️", layout="wide")
-
-st.title("⚙️ SourceMade Feature-Aware CAM Estimator")
-st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Simulation")
-
-st.info(f"🧠 **Live ML Kinematic Modifiers:** Outline (`{multipliers['outline']:.2f}x`) | Pocket (`{multipliers['pocket']:.2f}x`) | 3D Surface (`{multipliers['3d']:.2f}x`)")
-st.markdown("---")
-
 col1, col2 = st.columns([1, 2])
 with col1:
     unit_choice = st.radio("1. STEP Export Units", ["Millimeters (Standard for STEP)", "Inches", "Meters"], index=2)
@@ -276,7 +284,7 @@ with col2:
     uploaded_file = st.file_uploader("2. Upload STEP File (.step, .stp)", type=["step", "stp"])
 
 if uploaded_file is not None:
-    with st.spinner("Analyzing multi-body CAD geometry & predicting cycle times..."):
+    with st.spinner("Analyzing True B-Rep assembly & predicting cycle times..."):
         res = process_step_file(uploaded_file, unit_choice)
 
     if res is not None:
