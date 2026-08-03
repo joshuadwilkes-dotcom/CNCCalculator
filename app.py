@@ -139,13 +139,11 @@ def process_step_file(uploaded_file, unit_choice):
             st.error(f"STEP parser failed. Error: {e}")
             return None
 
-        # Break the assembly apart into distinct bodies/layers
         meshes = list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
         if not meshes: return None
         
         scale_factor = 1.0 / 25.4 if "Millimeters" in unit_choice else 39.3701 if unit_choice == "Meters" else 1.0
 
-        # Accumulators for the entire assembly
         total_outline_time = 0.0
         total_pocket_time = 0.0
         total_3d_time = 0.0
@@ -163,10 +161,7 @@ def process_step_file(uploaded_file, unit_choice):
             
             mesh.apply_scale(scale_factor)
 
-            # Isolate and orient THIS specific layer
             extents = mesh.extents
-            
-            # Skip micro-bodies (e.g. tiny screws or artifacts accidentally left in the STEP)
             if max(extents) < 1.0: 
                 continue 
 
@@ -180,7 +175,6 @@ def process_step_file(uploaded_file, unit_choice):
             max_detected_x = max(max_detected_x, final_x)
             max_detected_y = max(max_detected_y, final_y)
 
-            # Center the individual layer on the Z origin
             center = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
             mesh.apply_translation([-center[0], -center[1], -mesh.bounds[0][2]])
 
@@ -195,14 +189,41 @@ def process_step_file(uploaded_file, unit_choice):
             removed_vol = max(0.0, stock_vol - actual_mesh_vol)
             if removed_vol <= 0.5: removed_vol = stock_vol * 0.35
 
-            is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
+            # -----------------------------------------------------------
+            # UPGRADED 3D GEOMETRY DETECTION LOGIC (Draft-Aware)
+            # -----------------------------------------------------------
+            is_3d = False
+            if hasattr(mesh, "face_normals") and len(mesh.face_normals) > 0:
+                z_normals = np.abs(mesh.face_normals[:, 2])
+                
+                # Find faces that are angled (greater than ~3 degrees off vertical, less than flat)
+                angled_faces_mask = (z_normals > 0.05) & (z_normals < 0.99)
+                
+                # Spatial Filter: Ignore the outermost perimeter (External Draft)
+                min_x, min_y = mesh.bounds[0][:2]
+                max_x, max_y = mesh.bounds[1][:2]
+                
+                # Determine if a face center is within 0.3 inches of the absolute outer edge
+                face_centers = mesh.triangles_center
+                margin = 0.3 
+                
+                on_outer_perimeter = (
+                    (face_centers[:, 0] < min_x + margin) | (face_centers[:, 0] > max_x - margin) |
+                    (face_centers[:, 1] < min_y + margin) | (face_centers[:, 1] > max_y - margin)
+                )
+                
+                # Filter out the perimeter draft faces from the 3D check
+                valid_3d_faces = angled_faces_mask & (~on_outer_perimeter)
+                angled_count = np.sum(valid_3d_faces)
+                
+                if (angled_count / len(z_normals) > 0.05) or (angled_count > 200):
+                    is_3d = True
+            # -----------------------------------------------------------
 
-            # Generate math for THIS layer
             sim_res = cam_engine.estimate_layer_cam_time(
                 mesh=mesh, layer_z_height=categorized_z, removed_vol=removed_vol, is_3d_surface=is_3d
             )
 
-            # Accumulate totals
             total_outline_time += sim_res["est_outline"]
             total_pocket_time += sim_res["est_pocket"]
             total_3d_time += sim_res["est_3d"]
