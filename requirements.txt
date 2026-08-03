@@ -1,6 +1,4 @@
 streamlit
-trimesh
-shapely
-networkx
+pandas
 numpy
-cascadio
+cadquery
