@@ -56,31 +56,32 @@ class FoamCAMEngine:
 
     def estimate_layer_cam_time(self, mesh, layer_z_height, removed_vol=0.0, is_3d_surface=False):
         
-        # New Feature Buckets
         time_outline = 0.0
         time_pocket = 0.0
         time_3d = 0.0
         
         unique_tools_used = set()
+        polygons = []
         
+        # 1. MULTI-LEVEL SLICER
+        # Hunts for a valid closed polygon by testing the top, middle, and bottom of the mesh.
         try:
             top_z = mesh.bounds[1][2]
-            slice_plane_origin = [0, 0, top_z - 0.1]
-            slice_2d = mesh.section(plane_origin=slice_plane_origin, plane_normal=[0, 0, 1])
-
-            if slice_2d is None:
-                center_z = (mesh.bounds[0][2] + mesh.bounds[1][2]) / 2.0
-                slice_2d = mesh.section(plane_origin=[0, 0, center_z], plane_normal=[0, 0, 1])
-
-            if slice_2d is not None:
-                path_2d, _ = slice_2d.to_planar()
-                polygons = path_2d.polygons_full
-            else:
-                polygons = []
-                
+            bottom_z = mesh.bounds[0][2]
+            
+            slice_heights = [top_z - 0.125, bottom_z + (top_z - bottom_z) / 2.0, bottom_z + 0.125]
+            
+            for z in slice_heights:
+                slice_2d = mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+                if slice_2d is not None:
+                    path_2d, _ = slice_2d.to_planar()
+                    if path_2d.polygons_full:
+                        polygons = path_2d.polygons_full
+                        break # Valid geometry found, stop hunting
         except Exception:
-            polygons = []
+            pass
 
+        # 2. STANDARD KINEMATIC PROCESSING (If slicer found closed polygons)
         if polygons:
             prof_tool = self.tools["5/8_PROFILE"]
             unique_tools_used.add("5/8_PROFILE")
@@ -89,7 +90,7 @@ class FoamCAMEngine:
                 if poly is None or poly.is_empty:
                     continue
 
-                # 1. OUTLINE PROCESSING (Exteriors)
+                # Outline Processing
                 ext_length = poly.exterior.length
                 prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
                 
@@ -99,7 +100,7 @@ class FoamCAMEngine:
                 
                 time_outline += (ext_cut_time + ext_ramp_time)
 
-                # 2. POCKET & 3D PROCESSING (Interiors)
+                # Pocket Processing
                 for interior in poly.interiors:
                     pocket_poly = Polygon(interior)
                     pocket_area = pocket_poly.area
@@ -129,20 +130,39 @@ class FoamCAMEngine:
                     else:
                         time_pocket += total_interior_time
 
-        # 3. VOLUMETRIC MRR FAILSAFE
+        # 3. SMART BOUNDING-BOX FAILSAFE (If CAD is dirty and slicer failed)
         total_raw_time = time_outline + time_pocket + time_3d
-        if total_raw_time == 0.0 and removed_vol > 0.1:
-            estimated_cut_time = (removed_vol / 125.0) * 1.25
-            unique_tools_used.add("5/8_POCKET")
-            if is_3d_surface:
-                time_3d += estimated_cut_time
-            else:
-                time_pocket += estimated_cut_time
+        
+        if total_raw_time == 0.0:
+            # Mathematically force the Outline time based on the physical bounding box
+            prof_tool = self.tools["5/8_PROFILE"]
+            unique_tools_used.add("5/8_PROFILE")
+            
+            x_dim = mesh.extents[0]
+            y_dim = mesh.extents[1]
+            perimeter = (x_dim * 2.0) + (y_dim * 2.0)
+            
+            prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
+            ext_cut_time = (perimeter / prof_tool["cut_ipm"]) * prof_passes
+            ramp_dist = layer_z_height / math.sin(math.radians(prof_tool["ramp_angle_deg"]))
+            ext_ramp_time = (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
+            
+            time_outline = ext_cut_time + ext_ramp_time
+            
+            # Dump the remaining volume MRR into the pocket time
+            if removed_vol > 0.1:
+                unique_tools_used.add("5/8_POCKET")
+                estimated_pocket_time = (removed_vol / 125.0) * 1.25
+                if is_3d_surface:
+                    time_3d += estimated_pocket_time
+                else:
+                    time_pocket += estimated_pocket_time
 
-        # Distribute Tool Swap Penalty proportionally across the buckets
+        # 4. DISTRIBUTE TOOL SWAP PENALTIES
         tool_changes = max(0, len(unique_tools_used) - 1)
         tool_swap_penalty = tool_changes * self.cfg["tool_change_penalty_min"]
         
+        total_raw_time = time_outline + time_pocket + time_3d
         if total_raw_time > 0:
             time_outline += tool_swap_penalty * (time_outline / total_raw_time)
             time_pocket += tool_swap_penalty * (time_pocket / total_raw_time)
