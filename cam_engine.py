@@ -3,7 +3,6 @@ import numpy as np
 import trimesh
 from shapely.geometry import Polygon
 
-# Tool parameters matching Fusion 360 Tool Library
 CAM_CONFIG = {
     "tool_change_penalty_min": 1.0,
     "tools": {
@@ -56,20 +55,19 @@ class FoamCAMEngine:
             return "1/4_3D_SURFER"
 
     def estimate_layer_cam_time(self, mesh, layer_z_height, removed_vol=0.0, is_3d_surface=False):
-        """
-        Calculates cutting, ramping, and toolpath time for a given sliced mesh.
-        """
-        total_cut_time = 0.0
-        total_ramp_time = 0.0
+        
+        # New Feature Buckets
+        time_outline = 0.0
+        time_pocket = 0.0
+        time_3d = 0.0
+        
         unique_tools_used = set()
         
         try:
-            # 1. Slice 0.1 inches below the physical top of the mesh to guarantee pocket intersection
             top_z = mesh.bounds[1][2]
             slice_plane_origin = [0, 0, top_z - 0.1]
             slice_2d = mesh.section(plane_origin=slice_plane_origin, plane_normal=[0, 0, 1])
 
-            # Fallback: if the slice failed, try the geometric center
             if slice_2d is None:
                 center_z = (mesh.bounds[0][2] + mesh.bounds[1][2]) / 2.0
                 slice_2d = mesh.section(plane_origin=[0, 0, center_z], plane_normal=[0, 0, 1])
@@ -83,7 +81,6 @@ class FoamCAMEngine:
         except Exception:
             polygons = []
 
-        # 2. PERIMETER & POCKET CALCULATION
         if polygons:
             prof_tool = self.tools["5/8_PROFILE"]
             unique_tools_used.add("5/8_PROFILE")
@@ -92,17 +89,17 @@ class FoamCAMEngine:
                 if poly is None or poly.is_empty:
                     continue
 
+                # 1. OUTLINE PROCESSING (Exteriors)
                 ext_length = poly.exterior.length
                 prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
                 
-                # Direct cut time
-                total_cut_time += (ext_length / prof_tool["cut_ipm"]) * prof_passes
-                
-                # Helical ramp entry time
+                ext_cut_time = (ext_length / prof_tool["cut_ipm"]) * prof_passes
                 ramp_dist = layer_z_height / math.sin(math.radians(prof_tool["ramp_angle_deg"]))
-                total_ramp_time += (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
+                ext_ramp_time = (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
+                
+                time_outline += (ext_cut_time + ext_ramp_time)
 
-                # Area clearing math for pockets
+                # 2. POCKET & 3D PROCESSING (Interiors)
                 for interior in poly.interiors:
                     pocket_poly = Polygon(interior)
                     pocket_area = pocket_poly.area
@@ -121,35 +118,41 @@ class FoamCAMEngine:
                     pocket_passes = math.ceil(layer_z_height / p_tool["max_stepdown"])
 
                     pocket_cut_time = (clearing_distance / p_tool["cut_ipm"]) * pocket_passes
-
                     pocket_ramp_dist = layer_z_height / math.sin(math.radians(p_tool["ramp_angle_deg"]))
                     pocket_ramp_time = (pocket_ramp_dist / p_tool["ramp_ipm"]) * pocket_passes
 
+                    total_interior_time = pocket_cut_time + pocket_ramp_time
+
                     if is_3d_surface or pocket_tool_key == "1/4_3D_SURFER":
                         lookahead_multiplier = p_tool.get("lookahead_penalty", 1.35)
-                        pocket_cut_time *= lookahead_multiplier
-
-                    total_cut_time += pocket_cut_time
-                    total_ramp_time += pocket_ramp_time
+                        time_3d += (total_interior_time * lookahead_multiplier)
+                    else:
+                        time_pocket += total_interior_time
 
         # 3. VOLUMETRIC MRR FAILSAFE
-        # If toolpath polygons failed to generate (e.g. dirty CAD or filled pockets), 
-        # compute time automatically using Material Removal Rate (MRR) of the 5/8" pocket tool.
-        if total_cut_time == 0.0 and removed_vol > 0.1:
-            # Conservative foam MRR estimation (~125 in^3 per minute based on your feedrates)
-            estimated_cut_time = removed_vol / 125.0
-            # Add 25% penalty for rapids and ramping
-            total_cut_time = estimated_cut_time * 1.25
+        total_raw_time = time_outline + time_pocket + time_3d
+        if total_raw_time == 0.0 and removed_vol > 0.1:
+            estimated_cut_time = (removed_vol / 125.0) * 1.25
             unique_tools_used.add("5/8_POCKET")
+            if is_3d_surface:
+                time_3d += estimated_cut_time
+            else:
+                time_pocket += estimated_cut_time
 
-        # Calculate tool swaps required (1 min penalty per additional tool)
+        # Distribute Tool Swap Penalty proportionally across the buckets
         tool_changes = max(0, len(unique_tools_used) - 1)
         tool_swap_penalty = tool_changes * self.cfg["tool_change_penalty_min"]
-
-        raw_sim_time = total_cut_time + total_ramp_time + tool_swap_penalty
+        
+        if total_raw_time > 0:
+            time_outline += tool_swap_penalty * (time_outline / total_raw_time)
+            time_pocket += tool_swap_penalty * (time_pocket / total_raw_time)
+            time_3d += tool_swap_penalty * (time_3d / total_raw_time)
 
         return {
-            "total_time_min": raw_sim_time,
+            "total_time_min": time_outline + time_pocket + time_3d,
+            "est_outline": time_outline,
+            "est_pocket": time_pocket,
+            "est_3d": time_3d,
             "tool_changes": tool_changes,
             "tools_used": list(unique_tools_used)
         }
