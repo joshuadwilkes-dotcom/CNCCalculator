@@ -2,6 +2,7 @@ import os
 import sqlite3
 import math
 import numpy as np
+import pandas as pd
 import streamlit as st
 import trimesh
 
@@ -55,13 +56,22 @@ def fetch_all_jobs():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT file_name, total_area, total_layers, removed_vol, simulated_cam_time, actual_time, created_at FROM job_history ORDER BY id DESC")
+        # Added 'id' to the SELECT statement so we can target rows for deletion
+        c.execute("SELECT id, file_name, total_area, total_layers, removed_vol, simulated_cam_time, actual_time, created_at FROM job_history ORDER BY id DESC")
         rows = c.fetchall()
     except sqlite3.OperationalError:
         rows = []
     finally:
         conn.close()
     return rows
+
+def delete_job_by_id(job_id):
+    """Deletes a specific job from the database by its ID."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM job_history WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
 
 init_db()
 cam_engine = FoamCAMEngine()
@@ -82,7 +92,7 @@ def process_step_file(uploaded_file, unit_choice):
             st.error(f"STEP parser failed. Ensure Streamlit Cloud is set to Python 3.11 or 3.12. Error: {e}")
             return None
 
-        # 1. FLATTEN MULTI-BODY ASSEMBLIES
+        # FLATTEN MULTI-BODY ASSEMBLIES
         if isinstance(scene, trimesh.Scene):
             mesh = scene.dump(concatenate=True)
         else:
@@ -92,7 +102,7 @@ def process_step_file(uploaded_file, unit_choice):
             st.error("No valid 3D geometry could be extracted from the uploaded file.")
             return None
 
-        # 2. APPLY UNIT SCALING TO INCHES
+        # APPLY UNIT SCALING TO INCHES
         scale_factor = 1.0
         if unit_choice == "Millimeters (Standard for STEP)":
             scale_factor = 1.0 / 25.4
@@ -101,7 +111,7 @@ def process_step_file(uploaded_file, unit_choice):
 
         mesh.apply_scale(scale_factor)
 
-        # 3. FIX CAD ORIENTATION (AUTO-LAY FLAT)
+        # FIX CAD ORIENTATION (AUTO-LAY FLAT)
         extents = mesh.extents
         min_axis = np.argmin(extents)
         
@@ -119,7 +129,7 @@ def process_step_file(uploaded_file, unit_choice):
         center = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
         mesh.apply_translation([-center[0], -center[1], -mesh.bounds[0][2]])
 
-        # 4. DETERMINE Z STOCK SIZE
+        # DETERMINE Z STOCK SIZE
         stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]
         categorized_z = 9.0
         for size in stock_sizes:
@@ -127,7 +137,7 @@ def process_step_file(uploaded_file, unit_choice):
                 categorized_z = size
                 break
 
-        # 5. FOOLPROOF MATERIAL REMOVED CALCULATION
+        # FOOLPROOF MATERIAL REMOVED CALCULATION
         stock_vol = final_x * final_y * categorized_z
         try:
             actual_mesh_vol = abs(mesh.volume)
@@ -144,7 +154,7 @@ def process_step_file(uploaded_file, unit_choice):
         total_area = final_x * final_y
         is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
 
-        # 6. RUN CAM SIMULATION
+        # RUN CAM SIMULATION
         sim_res = cam_engine.estimate_layer_cam_time(
             mesh=mesh,
             layer_z_height=categorized_z,
@@ -232,25 +242,67 @@ if uploaded_file is not None:
                 st.success(f"Saved **{res['file_name']}** to database!")
 
 # -------------------------------------------------------------------
-# 4. DATABASE HISTORY VIEW
+# 4. DATABASE HISTORY VIEW & OUTLIER DETECTION
 # -------------------------------------------------------------------
 st.markdown("---")
-st.subheader("📊 Logged Job History (`vc_history.db`)")
+st.subheader("📊 Logged Job History & Outlier Tracking")
 
 history_data = fetch_all_jobs()
 if history_data:
-    st.dataframe(
-        history_data,
-        column_config={
-            "0": "File Name",
-            "1": "Total Area (in²)",
-            "2": "Layers",
-            "3": "Removed Vol (in³)",
-            "4": "Simulated Time (min)",
-            "5": "Actual Floor Time (min)",
-            "6": "Logged At"
-        },
-        use_container_width=True
-    )
+    # Convert SQL data into a Pandas DataFrame for analytics
+    df = pd.DataFrame(history_data, columns=[
+        "ID", "File Name", "Area (in²)", "Layers", "Removed Vol (in³)", 
+        "Simulated (min)", "Actual (min)", "Logged At"
+    ])
+
+    # Calculate the Error Percentage
+    # Formula: Absolute Difference / Simulated Time * 100
+    safe_sim = df["Simulated (min)"].replace(0, 0.1)
+    df["Error %"] = ((df["Actual (min)"] - df["Simulated (min)"]).abs() / safe_sim) * 100
+
+    # Define Outlier Logic: Flag if error is > 25% AND off by more than 2 minutes
+    def flag_outlier(row):
+        if row["Error %"] > 25.0 and abs(row["Actual (min)"] - row["Simulated (min)"]) >= 2.0:
+            return "⚠️ Outlier"
+        return "✅ Accurate"
+
+    df["Status"] = df.apply(flag_outlier, axis=1)
+
+    # Style function to highlight outlier rows with a soft red background
+    def highlight_outliers(row):
+        color = 'background-color: rgba(255, 75, 75, 0.15)' if row["Status"] == "⚠️ Outlier" else ''
+        return [color] * len(row)
+
+    # Format numbers for clean display
+    styled_df = df.style.apply(highlight_outliers, axis=1).format({
+        "Simulated (min)": "{:.2f}",
+        "Actual (min)": "{:.2f}",
+        "Error %": "{:.1f}%",
+        "Removed Vol (in³)": "{:.2f}",
+        "Area (in²)": "{:.1f}"
+    })
+
+    # Render the table
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+    # UI tool for deleting rows one-by-one
+    st.markdown("#### Manage Database")
+    del_col1, del_col2 = st.columns([3, 1])
+    
+    with del_col1:
+        # Create a dropdown mapping formatted as "12 - insert_base.step"
+        delete_options = df["ID"].astype(str) + " - " + df["File Name"]
+        selected_job = st.selectbox("Select a specific job to remove:", delete_options)
+        
+    with del_col2:
+        st.write("") # Formatting spacer
+        st.write("") # Formatting spacer
+        if st.button("🗑️ Delete Job", use_container_width=True):
+            if selected_job:
+                # Extract just the ID number from the string
+                job_id = int(selected_job.split(" - ")[0])
+                delete_job_by_id(job_id)
+                st.rerun() # Refresh page instantly
+
 else:
     st.caption("No floor jobs logged in database yet.")
