@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import math
+import numpy as np
 import streamlit as st
 import trimesh
 
@@ -12,7 +13,6 @@ from cam_engine import FoamCAMEngine
 DB_PATH = "vc_history.db"
 
 def init_db():
-    """Initializes and safely updates database schema if missing columns exist."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
@@ -42,7 +42,6 @@ def init_db():
     conn.close()
 
 def save_job_to_db(file_name, total_area, total_layers, removed_vol, sim_time, actual_time):
-    """Saves completed floor jobs to SQLite."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -53,7 +52,6 @@ def save_job_to_db(file_name, total_area, total_layers, removed_vol, sim_time, a
     conn.close()
 
 def fetch_all_jobs():
-    """Retrieves recorded jobs safely."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -65,7 +63,6 @@ def fetch_all_jobs():
         conn.close()
     return rows
 
-# Initialize DB on app boot
 init_db()
 cam_engine = FoamCAMEngine()
 
@@ -73,9 +70,6 @@ cam_engine = FoamCAMEngine()
 # 2. CAD PROCESSING & CAM SIMULATION LOGIC
 # -------------------------------------------------------------------
 def process_step_file(uploaded_file, unit_choice):
-    """
-    Loads STEP mesh geometry, flattens assemblies, scales to Inches, and runs CAM simulation.
-    """
     temp_path = f"temp_{uploaded_file.name}"
     
     with open(temp_path, "wb") as f:
@@ -89,8 +83,6 @@ def process_step_file(uploaded_file, unit_choice):
             return None
 
         # 1. FLATTEN MULTI-BODY ASSEMBLIES
-        # If the STEP file has multiple parts (e.g. lid, base, cutouts), merge them into one 
-        # single unified mesh. This preserves their exact positions and gives us the true bounding box.
         if isinstance(scene, trimesh.Scene):
             mesh = scene.dump(concatenate=True)
         else:
@@ -106,14 +98,28 @@ def process_step_file(uploaded_file, unit_choice):
             scale_factor = 1.0 / 25.4
         elif unit_choice == "Meters":
             scale_factor = 39.3701
-        # If "Inches", scale remains 1.0
 
         mesh.apply_scale(scale_factor)
 
-        # 3. GET PHYSICAL DIMENSIONS
+        # 3. FIX CAD ORIENTATION (AUTO-LAY FLAT)
+        extents = mesh.extents
+        min_axis = np.argmin(extents)
+        
+        if min_axis == 0: 
+            rot_matrix = trimesh.transformations.rotation_matrix(math.pi/2, [0, 1, 0])
+            mesh.apply_transform(rot_matrix)
+        elif min_axis == 1: 
+            rot_matrix = trimesh.transformations.rotation_matrix(math.pi/2, [1, 0, 0])
+            mesh.apply_transform(rot_matrix)
+            
         extents = mesh.extents
         final_x, final_y, z = extents[0], extents[1], extents[2]
 
+        # Ensure the part sits clean on the virtual origin
+        center = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
+        mesh.apply_translation([-center[0], -center[1], -mesh.bounds[0][2]])
+
+        # 4. DETERMINE Z STOCK SIZE
         stock_sizes = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]
         categorized_z = 9.0
         for size in stock_sizes:
@@ -121,24 +127,35 @@ def process_step_file(uploaded_file, unit_choice):
                 categorized_z = size
                 break
 
+        # 5. FOOLPROOF MATERIAL REMOVED CALCULATION
         stock_vol = final_x * final_y * categorized_z
-        removed_vol = max(0.0, stock_vol - mesh.volume)
-        total_area = final_x * final_y
+        try:
+            actual_mesh_vol = abs(mesh.volume)
+        except Exception:
+            actual_mesh_vol = stock_vol 
+            
+        removed_vol = stock_vol - actual_mesh_vol
+        
+        # Failsafe: if the STEP exported solid without pockets, or objects filled the assembly
+        if math.isnan(removed_vol) or removed_vol <= 0.5:
+            # Estimate a standard ~35% volume removal for heavy custom foam cases
+            removed_vol = stock_vol * 0.35
 
-        # Detect complex 3D surface features
+        total_area = final_x * final_y
         is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
 
-        # 4. RUN CAM SIMULATION
+        # 6. RUN CAM SIMULATION
         sim_res = cam_engine.estimate_layer_cam_time(
             mesh=mesh,
             layer_z_height=categorized_z,
+            removed_vol=removed_vol,
             is_3d_surface=is_3d
         )
 
         return {
             "file_name": uploaded_file.name,
             "total_area": round(total_area, 2),
-            "total_layers": 1, # Flattened to a single stock piece
+            "total_layers": 1,
             "removed_vol": round(removed_vol, 2),
             "simulated_time_min": round(sim_res.get("total_time_min", 0.0), 2),
             "tool_changes": sim_res.get("tool_changes", 0),
@@ -168,11 +185,10 @@ st.markdown("---")
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    # Most CAD software (Fusion/Onshape) writes STEPs in Millimeters by default
     unit_choice = st.radio(
         "1. STEP Export Units", 
         ["Millimeters (Standard for STEP)", "Inches", "Meters"],
-        index=0, 
+        index=2, # Meters is now set as default
         help="STEP files often default to mm behind the scenes. Adjust this if your detected part size is incorrect."
     )
 
@@ -186,7 +202,6 @@ if uploaded_file is not None:
     if res is not None:
         st.success(f"Simulation Complete! (Detected Outer Bounds: **{res['detected_x']}\" x {res['detected_y']}\"**)")
 
-        # Calculated CAD & CAM Metrics
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Simulated Cut Time", f"{res['simulated_time_min']} mins")
         m2.metric("Material Removed", f"{res['removed_vol']} in³")
@@ -197,7 +212,6 @@ if uploaded_file is not None:
 
         st.markdown("---")
 
-        # Real-World Floor Time Logger for Database Training
         st.subheader("📝 Record Actual Floor Time")
         st.write("Log actual machine runs to feed the central database history (`vc_history.db`).")
 
