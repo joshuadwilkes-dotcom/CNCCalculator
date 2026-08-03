@@ -3,7 +3,7 @@ import numpy as np
 import trimesh
 from shapely.geometry import Polygon
 
-# Tool parameters matching your Fusion 360 Tool Library
+# Tool parameters matching Fusion 360 Tool Library
 CAM_CONFIG = {
     "tool_change_penalty_min": 1.0,
     "tools": {
@@ -48,9 +48,6 @@ class FoamCAMEngine:
         self.tools = config["tools"]
 
     def select_pocket_tool(self, min_slot_width):
-        """
-        Determines if a narrow passage forces a tool swap to a smaller bit.
-        """
         if min_slot_width >= 0.625:
             return "5/8_POCKET"
         elif min_slot_width >= 0.375:
@@ -58,78 +55,92 @@ class FoamCAMEngine:
         else:
             return "1/4_3D_SURFER"
 
-    def estimate_layer_cam_time(self, mesh, layer_z_height, is_3d_surface=False):
+    def estimate_layer_cam_time(self, mesh, layer_z_height, removed_vol=0.0, is_3d_surface=False):
         """
         Calculates cutting, ramping, and toolpath time for a given sliced mesh.
         """
-        try:
-            slice_plane_origin = [0, 0, layer_z_height / 2.0]
-            slice_2d = mesh.section(plane_origin=slice_plane_origin, plane_normal=[0, 0, 1])
-
-            if slice_2d is None:
-                return {"total_time_min": 0.0, "tool_changes": 0, "tools_used": []}
-
-            path_2d, _ = slice_2d.to_planar()
-            polygons = path_2d.polygons_full
-        except Exception:
-            # Fallback for complex or non-watertight mesh slices
-            return {"total_time_min": 0.0, "tool_changes": 0, "tools_used": []}
-
         total_cut_time = 0.0
         total_ramp_time = 0.0
         unique_tools_used = set()
+        
+        try:
+            # 1. Slice 0.1 inches below the physical top of the mesh to guarantee pocket intersection
+            top_z = mesh.bounds[1][2]
+            slice_plane_origin = [0, 0, top_z - 0.1]
+            slice_2d = mesh.section(plane_origin=slice_plane_origin, plane_normal=[0, 0, 1])
 
-        # 1. PERIMETER / PROFILE CUTTING
-        prof_tool = self.tools["5/8_PROFILE"]
-        unique_tools_used.add("5/8_PROFILE")
+            # Fallback: if the slice failed, try the geometric center
+            if slice_2d is None:
+                center_z = (mesh.bounds[0][2] + mesh.bounds[1][2]) / 2.0
+                slice_2d = mesh.section(plane_origin=[0, 0, center_z], plane_normal=[0, 0, 1])
 
-        for poly in polygons:
-            if poly is None or poly.is_empty:
-                continue
+            if slice_2d is not None:
+                path_2d, _ = slice_2d.to_planar()
+                polygons = path_2d.polygons_full
+            else:
+                polygons = []
+                
+        except Exception:
+            polygons = []
 
-            ext_length = poly.exterior.length
-            prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
-            
-            # Direct cut time
-            total_cut_time += (ext_length / prof_tool["cut_ipm"]) * prof_passes
-            
-            # Helical ramp entry time
-            ramp_dist = layer_z_height / math.sin(math.radians(prof_tool["ramp_angle_deg"]))
-            total_ramp_time += (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
+        # 2. PERIMETER & POCKET CALCULATION
+        if polygons:
+            prof_tool = self.tools["5/8_PROFILE"]
+            unique_tools_used.add("5/8_PROFILE")
 
-            # 2. POCKET CLEARING
-            for interior in poly.interiors:
-                pocket_poly = Polygon(interior)
-                pocket_area = pocket_poly.area
+            for poly in polygons:
+                if poly is None or poly.is_empty:
+                    continue
 
-                # Measure narrow passage width
-                min_bounds_dim = min(
-                    pocket_poly.bounds[2] - pocket_poly.bounds[0], 
-                    pocket_poly.bounds[3] - pocket_poly.bounds[1]
-                )
+                ext_length = poly.exterior.length
+                prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
+                
+                # Direct cut time
+                total_cut_time += (ext_length / prof_tool["cut_ipm"]) * prof_passes
+                
+                # Helical ramp entry time
+                ramp_dist = layer_z_height / math.sin(math.radians(prof_tool["ramp_angle_deg"]))
+                total_ramp_time += (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
 
-                pocket_tool_key = self.select_pocket_tool(min_bounds_dim)
-                p_tool = self.tools[pocket_tool_key]
-                unique_tools_used.add(pocket_tool_key)
+                # Area clearing math for pockets
+                for interior in poly.interiors:
+                    pocket_poly = Polygon(interior)
+                    pocket_area = pocket_poly.area
 
-                # Area clearing math
-                effective_stepover = p_tool["diameter"] * p_tool["stepover_ratio"]
-                clearing_distance = pocket_area / effective_stepover
-                pocket_passes = math.ceil(layer_z_height / p_tool["max_stepdown"])
+                    min_bounds_dim = min(
+                        pocket_poly.bounds[2] - pocket_poly.bounds[0], 
+                        pocket_poly.bounds[3] - pocket_poly.bounds[1]
+                    )
 
-                pocket_cut_time = (clearing_distance / p_tool["cut_ipm"]) * pocket_passes
+                    pocket_tool_key = self.select_pocket_tool(min_bounds_dim)
+                    p_tool = self.tools[pocket_tool_key]
+                    unique_tools_used.add(pocket_tool_key)
 
-                # Plunge/ramp penalty
-                pocket_ramp_dist = layer_z_height / math.sin(math.radians(p_tool["ramp_angle_deg"]))
-                pocket_ramp_time = (pocket_ramp_dist / p_tool["ramp_ipm"]) * pocket_passes
+                    effective_stepover = p_tool["diameter"] * p_tool["stepover_ratio"]
+                    clearing_distance = pocket_area / effective_stepover
+                    pocket_passes = math.ceil(layer_z_height / p_tool["max_stepdown"])
 
-                # Apply 3D micro-segment lookahead penalty
-                if is_3d_surface or pocket_tool_key == "1/4_3D_SURFER":
-                    lookahead_multiplier = p_tool.get("lookahead_penalty", 1.35)
-                    pocket_cut_time *= lookahead_multiplier
+                    pocket_cut_time = (clearing_distance / p_tool["cut_ipm"]) * pocket_passes
 
-                total_cut_time += pocket_cut_time
-                total_ramp_time += pocket_ramp_time
+                    pocket_ramp_dist = layer_z_height / math.sin(math.radians(p_tool["ramp_angle_deg"]))
+                    pocket_ramp_time = (pocket_ramp_dist / p_tool["ramp_ipm"]) * pocket_passes
+
+                    if is_3d_surface or pocket_tool_key == "1/4_3D_SURFER":
+                        lookahead_multiplier = p_tool.get("lookahead_penalty", 1.35)
+                        pocket_cut_time *= lookahead_multiplier
+
+                    total_cut_time += pocket_cut_time
+                    total_ramp_time += pocket_ramp_time
+
+        # 3. VOLUMETRIC MRR FAILSAFE
+        # If toolpath polygons failed to generate (e.g. dirty CAD or filled pockets), 
+        # compute time automatically using Material Removal Rate (MRR) of the 5/8" pocket tool.
+        if total_cut_time == 0.0 and removed_vol > 0.1:
+            # Conservative foam MRR estimation (~125 in^3 per minute based on your feedrates)
+            estimated_cut_time = removed_vol / 125.0
+            # Add 25% penalty for rapids and ramping
+            total_cut_time = estimated_cut_time * 1.25
+            unique_tools_used.add("5/8_POCKET")
 
         # Calculate tool swaps required (1 min penalty per additional tool)
         tool_changes = max(0, len(unique_tools_used) - 1)
