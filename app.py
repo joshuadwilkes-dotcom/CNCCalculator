@@ -1,158 +1,318 @@
+import os
+import sqlite3
 import math
 import numpy as np
+import pandas as pd
+import streamlit as st
 import trimesh
-from shapely.geometry import Polygon
 
-CAM_CONFIG = {
-    "tool_change_penalty_min": 1.0,
-    "tools": {
-        "5/8_POCKET": {
-            "diameter": 0.625,
-            "cut_ipm": 350.0,
-            "ramp_ipm": 150.0,
-            "ramp_angle_deg": 45.0,
-            "max_stepdown": 1.5,
-            "stepover_ratio": 0.65
-        },
-        "5/8_PROFILE": {
-            "diameter": 0.625,
-            "cut_ipm": 150.0,
-            "ramp_ipm": 150.0,
-            "ramp_angle_deg": 45.0,
-            "max_stepdown": 1.0,
-            "stepover_ratio": 1.0
-        },
-        "3/8_FOAM": {
-            "diameter": 0.375,
-            "cut_ipm": 350.0,
-            "ramp_ipm": 13.333,
-            "ramp_angle_deg": 89.0,
-            "max_stepdown": 1.0,
-            "stepover_ratio": 0.60
-        },
-        "1/4_3D_SURFER": {
-            "diameter": 0.250,
-            "cut_ipm": 150.0,
-            "ramp_ipm": 150.0,
-            "ramp_angle_deg": 20.0,
-            "max_stepdown": 0.5,
-            "lookahead_penalty": 1.35
-        }
-    }
-}
+from cam_engine import FoamCAMEngine
 
-class FoamCAMEngine:
-    def __init__(self, config=CAM_CONFIG):
-        self.cfg = config
-        self.tools = config["tools"]
+# -------------------------------------------------------------------
+# 1. DATABASE SETUP & AUTO-MIGRATION
+# -------------------------------------------------------------------
+DB_PATH = "vc_history.db"
 
-    def select_pocket_tool(self, min_slot_width):
-        if min_slot_width >= 0.625:
-            return "5/8_POCKET"
-        elif min_slot_width >= 0.375:
-            return "3/8_FOAM"
-        else:
-            return "1/4_3D_SURFER"
-
-    def estimate_layer_cam_time(self, mesh, layer_z_height, removed_vol=0.0, is_3d_surface=False):
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS job_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT,
+            total_area REAL,
+            total_layers INTEGER,
+            removed_vol REAL,
+            simulated_cam_time REAL DEFAULT 0.0,
+            actual_time REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    c.execute("PRAGMA table_info(job_history)")
+    existing_columns = [col[1] for col in c.fetchall()]
+    
+    if "simulated_cam_time" not in existing_columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN simulated_cam_time REAL DEFAULT 0.0")
         
-        # New Feature Buckets
-        time_outline = 0.0
-        time_pocket = 0.0
-        time_3d = 0.0
+    # Add new feature-specific time columns
+    if "est_outline" not in existing_columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN est_outline REAL DEFAULT 0.0")
+    if "est_pocket" not in existing_columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN est_pocket REAL DEFAULT 0.0")
+    if "est_3d" not in existing_columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN est_3d REAL DEFAULT 0.0")
         
-        unique_tools_used = set()
+    if "created_at" not in existing_columns:
+        c.execute("ALTER TABLE job_history ADD COLUMN created_at TIMESTAMP")
         
+    conn.commit()
+    conn.close()
+
+def save_job_to_db(file_name, total_area, removed_vol, est_outline, est_pocket, est_3d, total_sim, actual_time):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO job_history 
+        (file_name, total_area, total_layers, removed_vol, est_outline, est_pocket, est_3d, simulated_cam_time, actual_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (file_name, total_area, 1, removed_vol, est_outline, est_pocket, est_3d, total_sim, actual_time))
+    conn.commit()
+    conn.close()
+
+def fetch_all_jobs():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT id, file_name, removed_vol, est_outline, est_pocket, est_3d, simulated_cam_time, actual_time FROM job_history ORDER BY id DESC")
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return rows
+
+def delete_job_by_id(job_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM job_history WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+
+init_db()
+cam_engine = FoamCAMEngine()
+
+# -------------------------------------------------------------------
+# 2. FEATURE-BASED MULTIPLE LINEAR REGRESSION
+# -------------------------------------------------------------------
+def calculate_feature_multipliers(df):
+    """
+    Uses Ordinary Least Squares (OLS) to solve the algebraic matrix:
+    (Outline_Time * c1) + (Pocket_Time * c2) + (3D_Time * c3) = Actual_Floor_Time
+    """
+    base_mults = {"outline": 1.0, "pocket": 1.0, "3d": 1.0}
+    
+    if df is None or df.empty:
+        return base_mults
+
+    valid = df[(df["Actual (min)"] > 0) & (df["Total Simulated (min)"] > 0)]
+    if len(valid) < 3: 
+        return base_mults # Needs at least 3 logged jobs to run reliable matrix algebra
+
+    # Extract our variables (X) and our target answer (Y)
+    X = valid[["est_outline", "est_pocket", "est_3d"]].values
+    y = valid["Actual (min)"].values
+
+    # Regularization Prior: We add 3 "dummy" perfect jobs to the matrix. 
+    # This acts as an anchor, preventing the algorithm from spitting out wild 
+    # numbers (like negative multipliers) if a specific feature hasn't been cut yet.
+    prior_X = np.array([
+        [10.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0],
+        [0.0, 0.0, 10.0]
+    ])
+    prior_y = np.array([10.0, 10.0, 10.0])
+
+    X_reg = np.vstack([X, prior_X])
+    y_reg = np.concatenate([y, prior_y])
+
+    # Solve the linear equations
+    coeffs = np.linalg.lstsq(X_reg, y_reg, rcond=None)[0]
+
+    # Constrain multipliers to realistic limits (0.25x to 4.0x) to prevent machine crashing predictions
+    base_mults["outline"] = max(0.25, min(4.0, coeffs[0]))
+    base_mults["pocket"] = max(0.25, min(4.0, coeffs[1]))
+    base_mults["3d"] = max(0.25, min(4.0, coeffs[2]))
+
+    return base_mults
+
+# Fetch data on app boot to calibrate the engine
+history_data = fetch_all_jobs()
+df = pd.DataFrame(history_data, columns=[
+    "ID", "File Name", "Removed Vol (in³)", 
+    "est_outline", "est_pocket", "est_3d", "Total Simulated (min)", "Actual (min)"
+]) if history_data else pd.DataFrame()
+
+multipliers = calculate_feature_multipliers(df)
+
+# -------------------------------------------------------------------
+# 3. CAD PROCESSING & CAM SIMULATION LOGIC
+# -------------------------------------------------------------------
+def process_step_file(uploaded_file, unit_choice):
+    temp_path = f"temp_{uploaded_file.name}"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    try:
         try:
-            top_z = mesh.bounds[1][2]
-            slice_plane_origin = [0, 0, top_z - 0.1]
-            slice_2d = mesh.section(plane_origin=slice_plane_origin, plane_normal=[0, 0, 1])
+            scene = trimesh.load(temp_path, file_type='step')
+        except Exception as e:
+            st.error(f"STEP parser failed. Ensure Streamlit Cloud is set to Python 3.11 or 3.12. Error: {e}")
+            return None
 
-            if slice_2d is None:
-                center_z = (mesh.bounds[0][2] + mesh.bounds[1][2]) / 2.0
-                slice_2d = mesh.section(plane_origin=[0, 0, center_z], plane_normal=[0, 0, 1])
+        if isinstance(scene, trimesh.Scene):
+            mesh = scene.dump(concatenate=True)
+        else:
+            mesh = scene
 
-            if slice_2d is not None:
-                path_2d, _ = slice_2d.to_planar()
-                polygons = path_2d.polygons_full
-            else:
-                polygons = []
-                
-        except Exception:
-            polygons = []
+        if mesh.is_empty: return None
 
-        if polygons:
-            prof_tool = self.tools["5/8_PROFILE"]
-            unique_tools_used.add("5/8_PROFILE")
+        scale_factor = 1.0 / 25.4 if "Millimeters" in unit_choice else 39.3701 if unit_choice == "Meters" else 1.0
+        mesh.apply_scale(scale_factor)
 
-            for poly in polygons:
-                if poly is None or poly.is_empty:
-                    continue
+        extents = mesh.extents
+        min_axis = np.argmin(extents)
+        if min_axis == 0: mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi/2, [0, 1, 0]))
+        elif min_axis == 1: mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi/2, [1, 0, 0]))
+            
+        extents = mesh.extents
+        final_x, final_y, z = extents[0], extents[1], extents[2]
 
-                # 1. OUTLINE PROCESSING (Exteriors)
-                ext_length = poly.exterior.length
-                prof_passes = math.ceil(layer_z_height / prof_tool["max_stepdown"])
-                
-                ext_cut_time = (ext_length / prof_tool["cut_ipm"]) * prof_passes
-                ramp_dist = layer_z_height / math.sin(math.radians(prof_tool["ramp_angle_deg"]))
-                ext_ramp_time = (ramp_dist / prof_tool["ramp_ipm"]) * prof_passes
-                
-                time_outline += (ext_cut_time + ext_ramp_time)
+        center = (mesh.bounds[0] + mesh.bounds[1]) / 2.0
+        mesh.apply_translation([-center[0], -center[1], -mesh.bounds[0][2]])
 
-                # 2. POCKET & 3D PROCESSING (Interiors)
-                for interior in poly.interiors:
-                    pocket_poly = Polygon(interior)
-                    pocket_area = pocket_poly.area
+        categorized_z = 9.0
+        for size in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]:
+            if z <= size:
+                categorized_z = size
+                break
 
-                    min_bounds_dim = min(
-                        pocket_poly.bounds[2] - pocket_poly.bounds[0], 
-                        pocket_poly.bounds[3] - pocket_poly.bounds[1]
-                    )
+        stock_vol = final_x * final_y * categorized_z
+        actual_mesh_vol = abs(mesh.volume) if not math.isnan(getattr(mesh, "volume", float('nan'))) else stock_vol 
+        removed_vol = max(0.0, stock_vol - actual_mesh_vol)
+        if removed_vol <= 0.5: removed_vol = stock_vol * 0.35
 
-                    pocket_tool_key = self.select_pocket_tool(min_bounds_dim)
-                    p_tool = self.tools[pocket_tool_key]
-                    unique_tools_used.add(pocket_tool_key)
+        is_3d = getattr(mesh, "is_watertight", False) and (len(getattr(mesh, "faces", [])) > 5000)
 
-                    effective_stepover = p_tool["diameter"] * p_tool["stepover_ratio"]
-                    clearing_distance = pocket_area / effective_stepover
-                    pocket_passes = math.ceil(layer_z_height / p_tool["max_stepdown"])
-
-                    pocket_cut_time = (clearing_distance / p_tool["cut_ipm"]) * pocket_passes
-                    pocket_ramp_dist = layer_z_height / math.sin(math.radians(p_tool["ramp_angle_deg"]))
-                    pocket_ramp_time = (pocket_ramp_dist / p_tool["ramp_ipm"]) * pocket_passes
-
-                    total_interior_time = pocket_cut_time + pocket_ramp_time
-
-                    if is_3d_surface or pocket_tool_key == "1/4_3D_SURFER":
-                        lookahead_multiplier = p_tool.get("lookahead_penalty", 1.35)
-                        time_3d += (total_interior_time * lookahead_multiplier)
-                    else:
-                        time_pocket += total_interior_time
-
-        # 3. VOLUMETRIC MRR FAILSAFE
-        total_raw_time = time_outline + time_pocket + time_3d
-        if total_raw_time == 0.0 and removed_vol > 0.1:
-            estimated_cut_time = (removed_vol / 125.0) * 1.25
-            unique_tools_used.add("5/8_POCKET")
-            if is_3d_surface:
-                time_3d += estimated_cut_time
-            else:
-                time_pocket += estimated_cut_time
-
-        # Distribute Tool Swap Penalty proportionally across the buckets
-        tool_changes = max(0, len(unique_tools_used) - 1)
-        tool_swap_penalty = tool_changes * self.cfg["tool_change_penalty_min"]
-        
-        if total_raw_time > 0:
-            time_outline += tool_swap_penalty * (time_outline / total_raw_time)
-            time_pocket += tool_swap_penalty * (time_pocket / total_raw_time)
-            time_3d += tool_swap_penalty * (time_3d / total_raw_time)
+        # GENERATE RAW MATH
+        sim_res = cam_engine.estimate_layer_cam_time(
+            mesh=mesh, layer_z_height=categorized_z, removed_vol=removed_vol, is_3d_surface=is_3d
+        )
 
         return {
-            "total_time_min": time_outline + time_pocket + time_3d,
-            "est_outline": time_outline,
-            "est_pocket": time_pocket,
-            "est_3d": time_3d,
-            "tool_changes": tool_changes,
-            "tools_used": list(unique_tools_used)
+            "file_name": uploaded_file.name,
+            "total_area": round(final_x * final_y, 2),
+            "removed_vol": round(removed_vol, 2),
+            "raw_outline": sim_res["est_outline"],
+            "raw_pocket": sim_res["est_pocket"],
+            "raw_3d": sim_res["est_3d"],
+            "raw_total": sim_res["total_time_min"],
+            "tool_changes": sim_res["tool_changes"],
+            "tools_list": ", ".join(sim_res.get("tools_used", [])) if sim_res.get("tools_used") else "5/8_POCKET",
+            "detected_x": round(final_x, 2),
+            "detected_y": round(final_y, 2)
         }
+
+    except Exception as e:
+        st.error(f"Error parsing geometry: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
+
+# -------------------------------------------------------------------
+# 4. STREAMLIT USER INTERFACE
+# -------------------------------------------------------------------
+st.set_page_config(page_title="SourceMade CAM Estimator", page_icon="⚙️", layout="wide")
+
+st.title("⚙️ SourceMade Feature-Aware CAM Estimator")
+st.caption("Automated Foam Insert Pocketing, Perimeter, & Ramping Cycle Time Simulation")
+
+# UI Feedback for the Machine Learning Model
+st.info(f"🧠 **Live ML Kinematic Modifiers:** Outline (`{multipliers['outline']:.2f}x`) | Pocket (`{multipliers['pocket']:.2f}x`) | 3D Surface (`{multipliers['3d']:.2f}x`)")
+
+st.markdown("---")
+
+col1, col2 = st.columns([1, 2])
+with col1:
+    unit_choice = st.radio("1. STEP Export Units", ["Millimeters (Standard for STEP)", "Inches", "Meters"], index=2)
+with col2:
+    uploaded_file = st.file_uploader("2. Upload STEP File (.step, .stp)", type=["step", "stp"])
+
+if uploaded_file is not None:
+    with st.spinner("Analyzing CAD geometry & predicting cycle times..."):
+        res = process_step_file(uploaded_file, unit_choice)
+
+    if res is not None:
+        st.success(f"Simulation Complete! (Detected Bounds: **{res['detected_x']}\" x {res['detected_y']}\"**)")
+
+        # APPLY REGRESSION MULTIPLIERS TO THE RAW MATH
+        adj_outline = res['raw_outline'] * multipliers['outline']
+        adj_pocket = res['raw_pocket'] * multipliers['pocket']
+        adj_3d = res['raw_3d'] * multipliers['3d']
+        final_adjusted_time = adj_outline + adj_pocket + adj_3d
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Predicted Floor Time", f"{final_adjusted_time:.2f} mins")
+        m2.metric("Material Removed", f"{res['removed_vol']} in³")
+        m3.metric("Raw Kinematic Math", f"{res['raw_total']:.2f} mins")
+        m4.metric("Tool Swaps", res['tool_changes'])
+
+        st.info(f"**Tools Called:** {res['tools_list']} | **Feature Breakdown:** {adj_outline:.1f}m Outline, {adj_pocket:.1f}m Pocket, {adj_3d:.1f}m 3D")
+
+        st.markdown("---")
+        st.subheader("📝 Record Actual Floor Time")
+        
+        with st.form("log_actual_time_form"):
+            safe_default = max(0.1, float(final_adjusted_time))
+            actual_floor_time = st.number_input("Actual Floor Run Time (Minutes):", min_value=0.1, value=safe_default, step=0.5)
+            submit_btn = st.form_submit_button("Save Job to Database")
+
+            if submit_btn:
+                save_job_to_db(
+                    file_name=res['file_name'], total_area=res['total_area'], removed_vol=res['removed_vol'],
+                    est_outline=res['raw_outline'], est_pocket=res['raw_pocket'], est_3d=res['raw_3d'], 
+                    total_sim=res['raw_total'], actual_time=actual_floor_time
+                )
+                st.success(f"Saved to database! The ML engine will recalibrate on your next upload.")
+
+# -------------------------------------------------------------------
+# 5. DATABASE HISTORY VIEW & OUTLIER DETECTION
+# -------------------------------------------------------------------
+st.markdown("---")
+st.subheader("📊 Logged Job History & ML Target Tracking")
+
+if not df.empty:
+    # Recalculate adjusted simulated time for the history table display
+    df["Adj. Predicted"] = (df["est_outline"] * multipliers['outline']) + \
+                           (df["est_pocket"] * multipliers['pocket']) + \
+                           (df["est_3d"] * multipliers['3d'])
+
+    df["Error %"] = ((df["Actual (min)"] - df["Adj. Predicted"]).abs() / df["Adj. Predicted"].replace(0, 0.1)) * 100
+
+    def flag_outlier(row):
+        if row["Error %"] > 25.0 and abs(row["Actual (min)"] - row["Adj. Predicted"]) >= 2.0:
+            return "⚠️ Outlier"
+        return "✅ Accurate"
+
+    df["Status"] = df.apply(flag_outlier, axis=1)
+
+    def highlight_outliers(row):
+        return ['background-color: rgba(255, 75, 75, 0.15)' if row["Status"] == "⚠️ Outlier" else ''] * len(row)
+
+    display_df = df[["ID", "File Name", "Removed Vol (in³)", "Total Simulated (min)", "Adj. Predicted", "Actual (min)", "Error %", "Status"]]
+    
+    styled_df = display_df.style.apply(highlight_outliers, axis=1).format({
+        "Total Simulated (min)": "{:.2f}",
+        "Adj. Predicted": "{:.2f}",
+        "Actual (min)": "{:.2f}",
+        "Error %": "{:.1f}%",
+        "Removed Vol (in³)": "{:.2f}"
+    })
+
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Manage Database")
+    del_col1, del_col2 = st.columns([3, 1])
+    with del_col1:
+        delete_options = df["ID"].astype(str) + " - " + df["File Name"]
+        selected_job = st.selectbox("Select a specific job to remove:", delete_options)
+    with del_col2:
+        st.write("") 
+        st.write("") 
+        if st.button("🗑️ Delete Job", use_container_width=True):
+            if selected_job:
+                delete_job_by_id(int(selected_job.split(" - ")[0]))
+                st.rerun() 
+else:
+    st.caption("No floor jobs logged in database yet.")
